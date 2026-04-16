@@ -15,11 +15,9 @@ RUBIKA_TOKEN    = os.getenv("RUBIKA_BOT_TOKEN")
 RUBIKA_API_URL  = os.getenv("RUBIKA_API_URL", "https://botapi.rubika.ir/v3")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-ADMIN_USER_ID   = os.getenv("ADMIN_USER_ID", "")
 WEBHOOK_URL     = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "secret")
 PORT            = int(os.getenv("PORT", 5000))
-OFFSET_ID       = "0"  # for long polling (getUpdates)
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -32,8 +30,7 @@ app = Flask(__name__)
 
 # ─── Simple in-memory storage (resets on restart) ────────────────────────────
 # For persistence, replace with a simple JSON file or SQLite
-users = {}          # { user_id: { "name": str, "username": str, "blocked": bool, "chat_history": [] } }
-bot_enabled = True  # admin can toggle this
+users = {}          # { user_id: { "name": str, "username": str, "chat_history": [] } }
 
 # ─── Rubika API helpers ───────────────────────────────────────────────────────
 def rubika(method, payload={}):
@@ -78,16 +75,10 @@ def register_user(user_id, first_name, username):
         users[user_id] = {
             "name": first_name or "Unknown",
             "username": username or "",
-            "blocked": False,
             "chat_history": [],
             "message_count": 0
         }
         log.info(f"New user registered: {user_id} (@{username})")
-        # Notify admin of new user
-        send(ADMIN_USER_ID, f"👤 *New user joined!*\nID: `{user_id}`\nName: {first_name}\nUsername: @{username}")
-
-def is_blocked(user_id):
-    return users.get(user_id, {}).get("blocked", False)
 
 # ─── Gemini AI ────────────────────────────────────────────────────────────────
 def ask_gemini(user_id, user_message):
@@ -139,129 +130,11 @@ def handle_help(user_id):
         "/help - This help message\n"
     ))
 
-# ─── Admin panel ──────────────────────────────────────────────────────────────
-def handle_admin(user_id):
-    if user_id != ADMIN_USER_ID:
-        send(user_id, "⛔ You are not authorized.")
-        return
-
-    total = len(users)
-    blocked = sum(1 for u in users.values() if u.get("blocked"))
-    active = total - blocked
-
-    send_menu(user_id,
-        f"🛠️ *Admin Panel*\n\n"
-        f"👥 Total users: {total}\n"
-        f"✅ Active: {active}\n"
-        f"🚫 Blocked: {blocked}\n"
-        f"🤖 Bot enabled: {'Yes' if bot_enabled else 'No'}",
-        [
-            ("📋 List Users", "admin_list"),
-            ("🔄 Toggle Bot", "admin_toggle"),
-            ("📢 Broadcast", "admin_broadcast_prompt"),
-        ]
-    )
-
-def handle_admin_callback(user_id, data, message_id):
-    if user_id != ADMIN_USER_ID:
-        return
-
-    global bot_enabled
-
-    if data == "admin_list":
-        if not users:
-            send(user_id, "No users yet.")
-            return
-        text = "👥 *User List:*\n\n"
-        for uid, info in list(users.items())[:20]:  # limit to 20
-            status = "🚫" if info.get("blocked") else "✅"
-            text += f"{status} `{uid}` - {info['name']} (@{info.get('username','?')}) - msgs: {info.get('message_count',0)}\n"
-        send(user_id, text)
-
-    elif data == "admin_toggle":
-        bot_enabled = not bot_enabled
-        send(user_id, f"🤖 Bot is now {'*enabled* ✅' if bot_enabled else '*disabled* 🚫'}")
-
-    elif data.startswith("admin_block_"):
-        target_id = int(data.split("_")[2])
-        if target_id in users:
-            users[target_id]["blocked"] = True
-            send(user_id, f"🚫 User `{target_id}` has been blocked.")
-            send(target_id, "🚫 You have been blocked by the admin.")
-
-    elif data.startswith("admin_unblock_"):
-        target_id = int(data.split("_")[2])
-        if target_id in users:
-            users[target_id]["blocked"] = False
-            send(user_id, f"✅ User `{target_id}` has been unblocked.")
-            send(target_id, "✅ You have been unblocked! You can chat again.")
-
-# Admin commands: /block <id> /unblock <id> /broadcast <msg>
-def handle_admin_command(user_id, text):
-    if user_id != ADMIN_USER_ID:
-        send(user_id, "⛔ Not authorized.")
-        return
-
-    parts = text.strip().split(" ", 2)
-    cmd = parts[0].lower()
-
-    if cmd == "/block" and len(parts) >= 2:
-        target_id = int(parts[1])
-        if target_id in users:
-            users[target_id]["blocked"] = True
-            send(user_id, f"🚫 User `{target_id}` blocked.")
-            send(target_id, "🚫 You have been blocked by the admin.")
-        else:
-            send(user_id, "User not found.")
-
-    elif cmd == "/unblock" and len(parts) >= 2:
-        target_id = int(parts[1])
-        if target_id in users:
-            users[target_id]["blocked"] = False
-            send(user_id, f"✅ User `{target_id}` unblocked.")
-        else:
-            send(user_id, "User not found.")
-
-    elif cmd == "/broadcast" and len(parts) >= 2:
-        message = " ".join(parts[1:])
-        count = 0
-        for uid in users:
-            if not users[uid].get("blocked"):
-                send(uid, f"📢 *Message from Admin:*\n\n{message}")
-                count += 1
-        send(user_id, f"📢 Broadcast sent to {count} users.")
-
-    elif cmd == "/stats":
-        total = len(users)
-        blocked = sum(1 for u in users.values() if u.get("blocked"))
-        total_msgs = sum(u.get("message_count", 0) for u in users.values())
-        send(user_id, (
-            f"📊 *Bot Statistics*\n\n"
-            f"👥 Total users: {total}\n"
-            f"🚫 Blocked: {blocked}\n"
-            f"💬 Total messages: {total_msgs}\n"
-            f"🤖 Bot status: {'On' if bot_enabled else 'Off'}"
-        ))
-
-    elif cmd == "/users":
-        handle_admin_callback(user_id, "admin_list", None)
-
-    else:
-        send(user_id, "Unknown admin command.")
-
 # ─── Main update processor ────────────────────────────────────────────────────
 def process_update(data):
     try:
-        # Handle inline button clicks (InlineMessage)
+    # Handle inline button clicks (InlineMessage) - not used in current version
         if "inline_message" in data:
-            inline_msg = data["inline_message"]
-            user_id = inline_msg.get("sender_id", "")
-            button_id = inline_msg.get("aux_data", {}).get("button_id", "")
-            chat_id = inline_msg.get("chat_id", "")
-            message_id = inline_msg.get("message_id", "")
-            
-            if user_id and button_id:
-                handle_admin_callback(user_id, button_id, message_id)
             return
 
         # Handle regular messages (Update with NewMessage)
@@ -288,18 +161,8 @@ def process_update(data):
         first_name = chat_id if chat_id else user_id
 
         # Register user if new
-        if user_id not in users and user_id != ADMIN_USER_ID:
+        if user_id not in users:
             register_user(user_id, first_name, "")
-
-        # Admin commands
-        if user_id == ADMIN_USER_ID:
-            if text == "/admin":
-                handle_admin(user_id)
-                return
-            if text.startswith("/block") or text.startswith("/unblock") or \
-               text.startswith("/broadcast") or text == "/stats" or text == "/users":
-                handle_admin_command(user_id, text)
-                return
 
         # Standard commands
         if text == "/start":
@@ -310,16 +173,6 @@ def process_update(data):
             return
         elif text == "/help":
             handle_help(user_id)
-            return
-
-        # Block check
-        if is_blocked(user_id):
-            send(user_id, "🚫 You are blocked from using this bot.")
-            return
-
-        # Bot toggle check
-        if not bot_enabled and user_id != ADMIN_USER_ID:
-            send(user_id, "🔴 The bot is currently offline. Please try later.")
             return
 
         # Send to Gemini
@@ -337,8 +190,7 @@ def index():
     return jsonify({
         "status": "running",
         "bot": "Rubika Gemini Bot",
-        "users": len(users),
-        "bot_enabled": bot_enabled
+        "users": len(users)
     })
 
 @app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])

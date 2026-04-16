@@ -1,21 +1,19 @@
 services:
   - type: web
-    name: bale-gemini-bot
+    name: rubika-gemini-bot
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     envVars:
-      - key: BALE_BOT_TOKEN
+      - key: RUBIKA_BOT_TOKEN
         sync: false
-      - key: BALE_API_URL
-        value: https://tapi.bale.ai/bot
+      - key: RUBIKA_API_URL
+        value: https://botapi.rubika.ir/v3
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
         value: gemini-1.5-flash
       - key: ADMIN_USER_ID
-        sync: false
-      - key: ADMIN_USERNAME
         sync: false
       - key: WEBHOOK_URL
         sync: false

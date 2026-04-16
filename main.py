@@ -11,14 +11,15 @@ import google.generativeai as genai
 # ─── Load env ────────────────────────────────────────────────────────────────
 load_dotenv()
 
-BALE_TOKEN      = os.getenv("BALE_BOT_TOKEN")
-BALE_API_URL    = os.getenv("BALE_API_URL", "https://tapi.bale.ai/bot")
+RUBIKA_TOKEN    = os.getenv("RUBIKA_BOT_TOKEN")
+RUBIKA_API_URL  = os.getenv("RUBIKA_API_URL", "https://botapi.rubika.ir/v3")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-ADMIN_USER_ID   = int(os.getenv("ADMIN_USER_ID", "0"))
+ADMIN_USER_ID   = os.getenv("ADMIN_USER_ID", "")
 WEBHOOK_URL     = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "secret")
 PORT            = int(os.getenv("PORT", 5000))
+OFFSET_ID       = "0"  # for long polling (getUpdates)
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -34,26 +35,42 @@ app = Flask(__name__)
 users = {}          # { user_id: { "name": str, "username": str, "blocked": bool, "chat_history": [] } }
 bot_enabled = True  # admin can toggle this
 
-# ─── Bale API helpers ─────────────────────────────────────────────────────────
-def bale(method, payload={}):
-    url = f"{BALE_API_URL}{BALE_TOKEN}/{method}"
+# ─── Rubika API helpers ───────────────────────────────────────────────────────
+def rubika(method, payload={}):
+    url = f"{RUBIKA_API_URL}/{RUBIKA_TOKEN}/{method}"
     try:
         r = requests.post(url, json=payload, timeout=15)
         return r.json()
     except Exception as e:
-        log.error(f"Bale API error [{method}]: {e}")
+        log.error(f"Rubika API error [{method}]: {e}")
         return {}
 
-def send(chat_id, text, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return bale("sendMessage", payload)
+def send(chat_id, text):
+    payload = {"chat_id": chat_id, "text": text}
+    return rubika("sendMessage", payload)
 
 def send_menu(chat_id, text, buttons):
-    """Send message with inline keyboard"""
-    keyboard = {"inline_keyboard": [[{"text": b[0], "callback_data": b[1]}] for b in buttons]}
-    send(chat_id, text, reply_markup=keyboard)
+    """Send message with inline keyboard
+    buttons: list of (text, id) tuples, will be arranged in a grid
+    """
+    rows = []
+    for i in range(0, len(buttons), 2):  # 2 buttons per row
+        row_buttons = []
+        for j in range(2):
+            if i + j < len(buttons):
+                row_buttons.append({
+                    "id": buttons[i + j][1],
+                    "type": "Simple",
+                    "button_text": buttons[i + j][0]
+                })
+        rows.append({"buttons": row_buttons})
+    
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "inline_keypad": {"rows": rows}
+    }
+    return rubika("sendMessage", payload)
 
 # ─── User management ─────────────────────────────────────────────────────────
 def register_user(user_id, first_name, username):
@@ -233,35 +250,46 @@ def handle_admin_command(user_id, text):
         send(user_id, "Unknown admin command.")
 
 # ─── Main update processor ────────────────────────────────────────────────────
-def process_update(update):
+def process_update(data):
     try:
-        # Handle callback queries (button presses)
-        if "callback_query" in update:
-            cb = update["callback_query"]
-            user_id = cb["from"]["id"]
-            data = cb.get("data", "")
-            message_id = cb["message"]["message_id"]
-            handle_admin_callback(user_id, data, message_id)
-            # Answer callback to remove loading state
-            bale("answerCallbackQuery", {"callback_query_id": cb["id"]})
+        # Handle inline button clicks (InlineMessage)
+        if "inline_message" in data:
+            inline_msg = data["inline_message"]
+            user_id = inline_msg.get("sender_id", "")
+            button_id = inline_msg.get("aux_data", {}).get("button_id", "")
+            chat_id = inline_msg.get("chat_id", "")
+            message_id = inline_msg.get("message_id", "")
+            
+            if user_id and button_id:
+                handle_admin_callback(user_id, button_id, message_id)
             return
 
-        # Handle messages
-        if "message" not in update:
+        # Handle regular messages (Update with NewMessage)
+        if "update" not in data:
+            return
+        
+        update = data["update"]
+        update_type = update.get("type", "")
+        
+        if update_type != "NewMessage":
+            return
+        
+        chat_id = update.get("chat_id", "")
+        new_message = update.get("new_message", {})
+        
+        user_id = new_message.get("sender_id", "")
+        text = new_message.get("text", "").strip()
+        
+        if not text or not user_id:
             return
 
-        msg = update["message"]
-        user_id = msg["from"]["id"]
-        first_name = msg["from"].get("first_name", "User")
-        username = msg["from"].get("username", "")
-        text = msg.get("text", "").strip()
-
-        if not text:
-            return
+        # For now, use chat_id as first_name (Rubika doesn't send first_name in updates)
+        # We'll extract it from actual data if available
+        first_name = chat_id if chat_id else user_id
 
         # Register user if new
         if user_id not in users and user_id != ADMIN_USER_ID:
-            register_user(user_id, first_name, username)
+            register_user(user_id, first_name, "")
 
         # Admin commands
         if user_id == ADMIN_USER_ID:
@@ -275,7 +303,7 @@ def process_update(update):
 
         # Standard commands
         if text == "/start":
-            handle_start(user_id, first_name, username)
+            handle_start(user_id, first_name, "")
             return
         elif text == "/clear":
             handle_clear(user_id)
@@ -308,7 +336,7 @@ def index():
     """Keep-alive page so Render doesn't sleep the service"""
     return jsonify({
         "status": "running",
-        "bot": "Bale Gemini Bot",
+        "bot": "Rubika Gemini Bot",
         "users": len(users),
         "bot_enabled": bot_enabled
     })
@@ -337,15 +365,27 @@ def keep_alive():
 def setup_webhook():
     time.sleep(3)  # wait for Flask to start
     webhook_endpoint = f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}"
-    result = bale("setWebhook", {"url": webhook_endpoint})
+    
+    # Rubika uses updateBotEndpoints with type "NewMessage" for regular messages
+    # and "GetSelectionItem" for inline button clicks
+    
+    # Setup for NewMessage events
+    result = rubika("updateBotEndpoints", {"url": webhook_endpoint, "type": "NewMessage"})
     if result.get("ok"):
-        log.info(f"✅ Webhook set: {webhook_endpoint}")
+        log.info(f"✅ Webhook set for NewMessage: {webhook_endpoint}")
     else:
-        log.error(f"❌ Webhook failed: {result}")
+        log.error(f"❌ NewMessage webhook failed: {result}")
+    
+    # Setup for InlineMessage events (button clicks)
+    result = rubika("updateBotEndpoints", {"url": webhook_endpoint, "type": "GetSelectionItem"})
+    if result.get("ok"):
+        log.info(f"✅ Webhook set for GetSelectionItem: {webhook_endpoint}")
+    else:
+        log.error(f"❌ GetSelectionItem webhook failed: {result}")
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("🚀 Starting Bale Gemini Bot...")
+    log.info("🚀 Starting Rubika Gemini Bot...")
 
     # Start webhook setup in background
     threading.Thread(target=setup_webhook, daemon=True).start()

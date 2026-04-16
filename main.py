@@ -35,16 +35,24 @@ users = {}          # { user_id: { "name": str, "username": str, "chat_history":
 # ─── Rubika API helpers ───────────────────────────────────────────────────────
 def rubika(method, payload={}):
     url = f"{RUBIKA_API_URL}/{RUBIKA_TOKEN}/{method}"
+    log.debug(f"🔗 Rubika API call: {method}")
     try:
         r = requests.post(url, json=payload, timeout=15)
+        log.debug(f"📊 Rubika response: {r.status_code}")
         return r.json()
     except Exception as e:
-        log.error(f"Rubika API error [{method}]: {e}")
+        log.error(f"❌ Rubika API error [{method}]: {e}")
         return {}
 
 def send(chat_id, text):
+    log.info(f"📤 Sending message to {chat_id}: {text[:50]}")
     payload = {"chat_id": chat_id, "text": text}
-    return rubika("sendMessage", payload)
+    result = rubika("sendMessage", payload)
+    if result.get("ok"):
+        log.info(f"✅ Message sent successfully")
+    else:
+        log.error(f"❌ Failed to send message: {result}")
+    return result
 
 def send_menu(chat_id, text, buttons):
     """Send message with inline keyboard
@@ -133,18 +141,25 @@ def handle_help(user_id):
 # ─── Main update processor ────────────────────────────────────────────────────
 def process_update(data):
     try:
-    # Handle inline button clicks (InlineMessage) - not used in current version
+        log.info(f"🔄 Processing update...")
+        log.debug(f"Raw data: {data}")
+        
+        # Handle inline button clicks (InlineMessage) - not used in current version
         if "inline_message" in data:
+            log.info("📌 Received inline_message (button click) - skipping")
             return
 
         # Handle regular messages (Update with NewMessage)
         if "update" not in data:
+            log.warning("⚠️ No 'update' key in data")
             return
         
         update = data["update"]
         update_type = update.get("type", "")
+        log.info(f"📨 Update type: {update_type}")
         
         if update_type != "NewMessage":
+            log.warning(f"⚠️ Skipping non-NewMessage type: {update_type}")
             return
         
         chat_id = update.get("chat_id", "")
@@ -153,7 +168,10 @@ def process_update(data):
         user_id = new_message.get("sender_id", "")
         text = new_message.get("text", "").strip()
         
+        log.info(f"👤 User: {user_id}, Chat: {chat_id}, Text: {text[:50]}")
+        
         if not text or not user_id:
+            log.warning(f"❌ Missing user_id or text")
             return
 
         # For now, use chat_id as first_name (Rubika doesn't send first_name in updates)
@@ -162,26 +180,32 @@ def process_update(data):
 
         # Register user if new
         if user_id not in users:
+            log.info(f"✨ Registering new user: {user_id}")
             register_user(user_id, first_name, "")
 
         # Standard commands
         if text == "/start":
+            log.info(f"🚀 User {user_id} sent /start")
             handle_start(user_id, first_name, "")
             return
         elif text == "/clear":
+            log.info(f"🗑️ User {user_id} sent /clear")
             handle_clear(user_id)
             return
         elif text == "/help":
+            log.info(f"❓ User {user_id} sent /help")
             handle_help(user_id)
             return
 
         # Send to Gemini
+        log.info(f"💭 Sending to Gemini for user {user_id}")
         send(user_id, "⏳ Thinking...")
         reply = ask_gemini(user_id, text)
+        log.info(f"✅ Gemini replied: {reply[:50]}...")
         send(user_id, reply)
 
     except Exception as e:
-        log.error(f"Error processing update: {e}")
+        log.error(f"❌ Error processing update: {e}", exc_info=True)
 
 # ─── Flask routes ─────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
@@ -193,11 +217,26 @@ def index():
         "users": len(users)
     })
 
-@app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
+    """Webhook endpoint for receiving updates from Rubika"""
+    log.info(f"📥 Webhook received: {request.path}")
+    
+    # Verify webhook secret in headers or query params
+    secret = request.args.get('secret') or request.headers.get('X-Webhook-Secret')
+    if secret != WEBHOOK_SECRET:
+        log.warning(f"⚠️ Invalid webhook secret: {secret}")
+        return jsonify({"error": "Unauthorized"}), 401
+    
     data = request.get_json(silent=True)
+    log.info(f"📦 Data received: {json.dumps(data, indent=2)[:200]}...")  # Log first 200 chars
+    
     if data:
         threading.Thread(target=process_update, args=(data,)).start()
+        log.info("✅ Update processing started")
+    else:
+        log.error("❌ No JSON data received")
+    
     return jsonify({"ok": True})
 
 # ─── Keep-alive pinger (prevents Render free tier sleep) ─────────────────────
@@ -216,12 +255,17 @@ def keep_alive():
 # ─── Webhook setup ────────────────────────────────────────────────────────────
 def setup_webhook():
     time.sleep(3)  # wait for Flask to start
-    webhook_endpoint = f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}"
+    # Add webhook secret to URL as query parameter
+    webhook_endpoint = f"{WEBHOOK_URL}/webhook?secret={WEBHOOK_SECRET}"
+    
+    log.info(f"🔗 Setting up webhooks...")
+    log.info(f"📍 Webhook URL: {webhook_endpoint}")
     
     # Rubika uses updateBotEndpoints with type "NewMessage" for regular messages
     # and "GetSelectionItem" for inline button clicks
     
     # Setup for NewMessage events
+    log.info(f"📨 Setting up NewMessage webhook...")
     result = rubika("updateBotEndpoints", {"url": webhook_endpoint, "type": "NewMessage"})
     if result.get("ok"):
         log.info(f"✅ Webhook set for NewMessage: {webhook_endpoint}")
@@ -229,6 +273,7 @@ def setup_webhook():
         log.error(f"❌ NewMessage webhook failed: {result}")
     
     # Setup for InlineMessage events (button clicks)
+    log.info(f"📌 Setting up GetSelectionItem webhook...")
     result = rubika("updateBotEndpoints", {"url": webhook_endpoint, "type": "GetSelectionItem"})
     if result.get("ok"):
         log.info(f"✅ Webhook set for GetSelectionItem: {webhook_endpoint}")
@@ -237,12 +282,24 @@ def setup_webhook():
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    log.info("=" * 60)
     log.info("🚀 Starting Rubika Gemini Bot...")
+    log.info("=" * 60)
+    log.info(f"🔑 Bot Token: {RUBIKA_TOKEN[:10]}...***" if RUBIKA_TOKEN else "⚠️  Bot Token NOT SET!")
+    log.info(f"📡 API URL: {RUBIKA_API_URL}")
+    log.info(f"🌐 Webhook URL: {WEBHOOK_URL}/webhook" if WEBHOOK_URL else "⚠️  Webhook URL NOT SET!")
+    log.info(f"🔐 Webhook Secret: {WEBHOOK_SECRET[:5]}...***" if WEBHOOK_SECRET else "⚠️  Secret NOT SET!")
+    log.info(f"⚙️  Gemini Model: {GEMINI_MODEL}")
+    log.info(f"🚪 Port: {PORT}")
+    log.info("=" * 60)
 
     # Start webhook setup in background
     threading.Thread(target=setup_webhook, daemon=True).start()
 
     # Start keep-alive pinger
     threading.Thread(target=keep_alive, daemon=True).start()
+    
+    log.info("✅ Bot started! Listening for updates...")
+    log.info("=" * 60)
 
     app.run(host="0.0.0.0", port=PORT, debug=False)
